@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+
+sysfs_cpufreq_dir = "/sys/devices/system/cpu/cpufreq"
+sysfs_cpu_dir = "/sys/devices/system/cpu"
+
+# cpu flags
+has_sse = 0
+has_avx = 0
+has_avx512 = 0
+has_amx = 0
+
+# frequency table
+freq_table = {}
+
+def get_total_cpu_count():
+    return int(subprocess.check_output('lscpu | awk \'/^CPU\(s\):/ { print $2 }\'', shell=True))
+
+def get_online_cpu_count():
+    return int(subprocess.check_output('grep \'^processor\' /proc/cpuinfo | wc -l', shell=True))
+
+def get_total_socket_count():
+    return int(subprocess.check_output('lscpu | grep \'NUMA node(s)\' | awk -F \':\' \'{print $2}\'', shell=True).strip())
+
+def get_threads_per_core():
+    return int(subprocess.check_output('lscpu | grep \'Thread(s) per core\' | awk -F \':\' \'{print $2}\'', shell=True).strip())
+
+def get_cpufreq(cpu):
+    cpufreq_dir = '/sys/devices/system/cpu/cpufreq/policy' + str(cpu)
+    freq_khz = int(open(os.path.join(cpufreq_dir, 'scaling_cur_freq'), 'r').read().strip())
+    freq_mhz = float(freq_khz / 1000)
+    return int(round(freq_mhz / 100) * 100)
+
+def offline_cpu(cpu):
+    if cpu == 0:
+        return
+    sysfs_cpu_path = os.path.join(sysfs_cpu_dir, 'cpu' + str(cpu))
+    with open(os.path.join(sysfs_cpu_path, 'online'), 'w') as f:
+        f.write('0')
+
+def online_cpu(cpu):
+    if cpu == 0:
+        return
+    sysfs_cpu_path = os.path.join(sysfs_cpu_dir, 'cpu' + str(cpu))
+    with open(os.path.join(sysfs_cpu_path, 'online'), 'w') as f:
+        f.write('1')
+
+def get_cpu_model():
+    return subprocess.check_output('lscpu | grep \'Model name\' |  awk -F \':\' \'{print $2}\'', shell=True).strip()
+
+def print_environment():
+    lines = subprocess.check_output('lscpu').decode('utf-8').split('\n')
+    for line in lines:
+        if 'Model name:' in line:
+            model_name = line.split(':')[1].strip()
+        elif 'Flags:' in line:
+            has_sse = 1 if 'sse' in line else 0
+            has_avx = 1 if 'avx' in line else 0
+            has_avx512 = 1 if 'avx512' in line else 0
+            has_amx = 1 if 'amx' in line else 0
+        else:
+            continue
+
+    print('========== Processor information ==========\n{:<30}: {}\n{:<30}: {}\n{:<30}: sse = {} | avx = {} | avx512 = {} | amx = {}'.format('model_name', model_name, 'total_cpu_count', get_total_cpu_count(), 'supported instruction', has_sse, has_avx, has_avx512, has_amx))
+
+def process_running(pid):
+    return os.path.exists('/proc/{}'.format(pid))
+
+def run_sse_workload():
+    return subprocess.Popen('echo "scale=5000; a(1)*4" | taskset -ca 1 time bc -l >/dev/null 2> /dev/null', shell=True)
+
+def run_avx_workload():
+    return subprocess.Popen('taskset -c 1 ./matmul_avx > /dev/null', shell=True)
+
+def run_avx512_workload():
+    return subprocess.Popen('taskset -c 1 ./matmul_avx512 > /dev/null', shell=True)
+
+if __name__ == "__main__":
+    print_environment()
+
+    cpulist = open('/sys/devices/system/node/node0/cpulist', 'r').read().strip()
+
+    total_cpu_count = get_total_cpu_count()
+    online_cpu_count = get_online_cpu_count()
+    if online_cpu_count != total_cpu_count:
+        for i in range(2, total_cpu_count):
+            with open(os.path.join(sysfs_cpu_dir, 'cpu' + str(i), 'online'), 'w') as f:
+                f.write('1')
+
+    total_socket_count = get_total_socket_count()
+    threads_per_core = get_threads_per_core()
+    phy_cores_per_socket = int(total_cpu_count / total_socket_count / threads_per_core)
+
+    last_freq = get_cpufreq(1)
+    upper = phy_cores_per_socket
+    lower = phy_cores_per_socket
+    for i in reversed(range(0, phy_cores_per_socket, 2)):
+        current_workload = run_sse_workload()
+        if process_running(current_workload.pid):
+            freq = get_cpufreq(1)
+            if freq != last_freq:
+                freq_table[str(lower) + '-' + str(upper)] = last_freq
+                upper = lower - 1
+                last_freq = freq
+            else:
+                lower = i + 1
+
+            current_workload.wait()
+
+            if i == 0:
+                freq_table[str(lower) + '-' + str(upper)] = last_freq
+                break
+
+            offline_cpu(i)
+            offline_cpu(i + 96)
+            offline_cpu(i+1)
+            offline_cpu(i + 97)
+
+    print('{:<25} | {:<25}'.format('number of active cores', 'frequency(MHz)'))
+    for k in freq_table:
+        print('{:<25} | {:<25}'.format(k, freq_table[k]))
+
+    # restore the origin cpulist
+    ranges = cpulist.split(',')
+    for cpu_range in ranges:
+        cpuids = cpu_range.split('-')
+        if len(cpuids) == 1:
+            online_cpu(cpuids[0])
+        else:
+            for i in range(int(cpuids[0]), int(cpuids[1]) + 1):
+                online_cpu(i)
