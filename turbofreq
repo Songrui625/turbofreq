@@ -104,7 +104,7 @@ if __name__ == "__main__":
         if int(cpu_pair[1]) not in cpu_thread_sibling:
             cpu_thread_sibling[int(cpu_pair[0])] = int(cpu_pair[1])
 
-
+    # real run 
     last_freq = get_cpufreq(1)
     upper = phy_cores_per_socket
     lower = phy_cores_per_socket
@@ -116,8 +116,8 @@ if __name__ == "__main__":
                 freq_table[str(lower) + '-' + str(upper)] = last_freq
                 upper = lower - 1
                 last_freq = freq
-            else:
-                lower = i + 1
+
+            lower = i + 1
 
             current_workload.wait()
 
